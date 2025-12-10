@@ -17,34 +17,42 @@ class InertiaRacerEnv(gym.Env):
         self.SCREEN_SIZE = 800
         self.AGENT_RADIUS = 10
         self.TARGET_RADIUS = 15
-        self.OBSTACLE_RADIUS = 30 # 장애물 크기 인식 범위를 좀 더 넉넉하게
+        self.OBSTACLE_RADIUS = 30 
         
         self.MAX_SPEED = 150.0
-        self.ACCEL_POWER = 2.0 # 회피 기동을 위해 가속력 상향
-        self.FRICTION = 0.90   # 마찰력을 높여서(0.92->0.90) 제동을 쉽게 만듦
+        self.ACCEL_POWER = 2.0  # [고정] 가속력 제한 유지
+        self.FRICTION = 0.92
         
-        self.NUM_OBSTACLES = 3
+        self.NUM_OBSTACLES = 1
         
-        # LIDAR 설정
-        self.RAY_NUM = 15
+        # LIDAR
+        self.RAY_NUM = 15 
         self.RAY_ANGLES = np.linspace(-90, 90, self.RAY_NUM) 
-        self.BASE_RAY_LENGTH = 250.0
+        self.BASE_RAY_LENGTH = 200.0
 
         self.render_mode = render_mode
         self.screen = None
         self.clock = None
+        self.font = None
         
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
         
-        # 관측 공간
         obs_size = 5 + self.RAY_NUM
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float32)
+
+        # 상태 변수
+        self.active_waypoint = None
+        self.last_accel = np.array([0.0, 0.0])
+        self.prev_action = np.array([0.0, 0.0])
+        self.avoidance_timer = 0 
+        self.last_blocking_obs = None
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.pos = np.array([self.SCREEN_SIZE/2, self.SCREEN_SIZE/2], dtype=np.float32)
         self.vel = np.array([0.0, 0.0], dtype=np.float32)
         self.target = self._spawn_entity(padding=50)
+        
         self.obstacles = []
         for _ in range(self.NUM_OBSTACLES):
             self.obstacles.append(self._spawn_entity(padding=50, check_overlap=True))
@@ -52,6 +60,9 @@ class InertiaRacerEnv(gym.Env):
         self.score = 0
         self.steps = 0
         self.max_steps = 1000
+        self.prev_action = np.array([0.0, 0.0])
+        self.avoidance_timer = 0
+        self.last_blocking_obs = None
         return self._get_obs(), {}
 
     def _spawn_entity(self, padding=50, check_overlap=False):
@@ -60,7 +71,6 @@ class InertiaRacerEnv(gym.Env):
             if not check_overlap: return pos
             
             safe = True
-            # 생성 조건 강화
             if np.linalg.norm(pos - self.pos) < 150: safe = False
             if np.linalg.norm(pos - self.target) < 100: safe = False
             for obs in self.obstacles:
@@ -70,7 +80,8 @@ class InertiaRacerEnv(gym.Env):
     def _get_rays(self):
         speed = np.linalg.norm(self.vel)
         heading = math.atan2(self.vel[1], self.vel[0]) if speed > 1.0 else 0.0
-        current_ray_length = self.BASE_RAY_LENGTH + (speed * 1.0) # 속도 비례 길이
+        
+        current_ray_length = self.BASE_RAY_LENGTH + (speed * 6.0)
 
         ray_readings = []
         self.current_rays_rendering = [] 
@@ -97,46 +108,93 @@ class InertiaRacerEnv(gym.Env):
             
         return np.array(ray_readings, dtype=np.float32)
 
-    def _get_obs(self):
-        sensor_data = self._get_rays()
+    def _get_blocking_obstacle(self):
         to_target = self.target - self.pos
         dist_target = np.linalg.norm(to_target)
-        scale = self.SCREEN_SIZE
-        
-        obs = np.concatenate([
-            self.vel / self.MAX_SPEED,
-            to_target / scale,
-            [dist_target / scale],
-            sensor_data
-        ])
-        return obs.astype(np.float32)
-
-    # [핵심 추가] 목표물까지 가는 길이 막혔는지 확인하는 함수
-    def _check_path_blocked(self):
-        to_target = self.target - self.pos
-        dist_target = np.linalg.norm(to_target)
-        if dist_target == 0: return False
+        if dist_target == 0: return None
         
         dir_target = to_target / dist_target
-        
-        # 목표물까지 선을 그었을 때 장애물과 겹치는지 확인 (Raycast)
+        closest_blocking_obs = None
+        min_dist_to_obs = float('inf')
+
         for obs in self.obstacles:
             to_obs = obs - self.pos
             proj = np.dot(to_obs, dir_target)
             
-            # 장애물이 목표물보다 앞에 있고, 투영 거리가 가까우면
             if 0 < proj < dist_target:
                 perp_dist = np.linalg.norm(to_obs - (dir_target * proj))
-                # 장애물 반지름 + 여유공간(20) 안쪽이면 막힌 것으로 간주
-                if perp_dist < (self.OBSTACLE_RADIUS + self.AGENT_RADIUS + 10):
-                    return True
-        return False
+                safety_margin = self.OBSTACLE_RADIUS + self.AGENT_RADIUS + 40.0
+                
+                if perp_dist < safety_margin:
+                    dist_to_obs = np.linalg.norm(to_obs)
+                    if dist_to_obs < min_dist_to_obs:
+                        min_dist_to_obs = dist_to_obs
+                        closest_blocking_obs = obs
+        return closest_blocking_obs
+
+    def _get_detour_point(self, blocking_obs):
+        # [해결책 1] 빙빙 돌기(Orbiting) 방지 로직
+        to_obs = blocking_obs - self.pos
+        
+        # 1. 우회 반경을 크게 잡음
+        detour_offset = (self.OBSTACLE_RADIUS + self.AGENT_RADIUS) * 4.0
+        
+        perp_vec = np.array([-to_obs[1], to_obs[0]])
+        perp_vec = (perp_vec / (np.linalg.norm(perp_vec) + 1e-6)) * detour_offset
+        
+        # 2. [핵심] 장애물 옆(perp) + 장애물 뒤(target 방향)으로 좌표를 밈
+        # 이렇게 하면 웨이포인트가 장애물보다 '앞서' 나가게 되어 에이전트를 끌어당김
+        to_real_target = self.target - self.pos
+        target_dir = to_real_target / (np.linalg.norm(to_real_target) + 1e-6)
+        
+        # "전진형 바이어스" 추가 (장애물 뒤쪽으로 60픽셀 더 미룸)
+        forward_bias = target_dir * 60.0 
+        
+        waypoint1 = blocking_obs + perp_vec + forward_bias
+        waypoint2 = blocking_obs - perp_vec + forward_bias
+        
+        ref_vec = self.vel if np.linalg.norm(self.vel) > 1.0 else (self.target - self.pos)
+        
+        if np.dot(ref_vec, waypoint1 - self.pos) > np.dot(ref_vec, waypoint2 - self.pos):
+            return waypoint1
+        else:
+            return waypoint2
+
+    def _get_obs(self, sensor_data=None):
+        if sensor_data is None: sensor_data = self._get_rays()
+        
+        blocking_obs = self._get_blocking_obstacle()
+        
+        # 판단 고정 (Hysteresis)
+        if blocking_obs is not None:
+            self.last_blocking_obs = blocking_obs
+            self.avoidance_timer = 5
+        
+        if self.avoidance_timer > 0 and self.last_blocking_obs is not None:
+            self.active_waypoint = self._get_detour_point(self.last_blocking_obs)
+            self.avoidance_timer -= 1
+        else:
+            self.active_waypoint = self.target
+            self.last_blocking_obs = None
+
+        to_objective = self.active_waypoint - self.pos
+        dist_objective = np.linalg.norm(to_objective)
+        scale = self.SCREEN_SIZE
+        
+        obs = np.concatenate([
+            self.vel / self.MAX_SPEED,
+            to_objective / scale,
+            [dist_objective / scale],
+            sensor_data
+        ])
+        return obs.astype(np.float32)
 
     def step(self, action):
         self.steps += 1
         
-        # 1. 물리 적용
         accel = np.array(action) * self.ACCEL_POWER
+        self.last_accel = accel
+        
         self.vel += accel
         speed = np.linalg.norm(self.vel)
         if speed > self.MAX_SPEED:
@@ -144,66 +202,80 @@ class InertiaRacerEnv(gym.Env):
         self.vel *= self.FRICTION
         self.pos += self.vel
         
-        reward = -0.01 # 시간 페널티
+        reward = -0.05 
         terminated = False
         
-        # 2. 벽 충돌 처리
+        # --- [해결책 2] 벽 반발장 (Wall Repulsion Field) ---
+        # 벽에 닿지 않았더라도 근처에 가면 페널티를 주어 중앙으로 밀어냄
+        WALL_MARGIN = 60.0 # 벽 근처 60픽셀부터 위험지역
+        wall_penalty = 0.0
+        
+        # X축 벽 감지
+        if self.pos[0] < WALL_MARGIN:
+            wall_penalty += (WALL_MARGIN - self.pos[0]) / WALL_MARGIN
+        elif self.pos[0] > self.SCREEN_SIZE - WALL_MARGIN:
+            wall_penalty += (self.pos[0] - (self.SCREEN_SIZE - WALL_MARGIN)) / WALL_MARGIN
+            
+        # Y축 벽 감지
+        if self.pos[1] < WALL_MARGIN:
+            wall_penalty += (WALL_MARGIN - self.pos[1]) / WALL_MARGIN
+        elif self.pos[1] > self.SCREEN_SIZE - WALL_MARGIN:
+            wall_penalty += (self.pos[1] - (self.SCREEN_SIZE - WALL_MARGIN)) / WALL_MARGIN
+            
+        if wall_penalty > 0:
+            reward -= wall_penalty * 0.5 # 벽 근처에 있으면 지속적인 고통
+            
+        # 실제 벽 충돌 처리
         if self.pos[0] < 0 or self.pos[0] > self.SCREEN_SIZE or self.pos[1] < 0 or self.pos[1] > self.SCREEN_SIZE:
             self.pos = np.clip(self.pos, 0, self.SCREEN_SIZE)
             self.vel *= 0.5
-            reward -= 5.0 # 벽도 강하게 처벌
+            reward -= 5.0 # 충돌 시 추가 감점
 
-        # 3. 장애물 처리
-        min_obs_dist = float('inf')
+        # TTC (속도 제어 유도)
+        sensor_data = self._get_rays()
+        min_dist_normalized = np.min(sensor_data)
+        
+        speed_ratio = speed / self.MAX_SPEED
+        urgency = (speed_ratio ** 2) / (min_dist_normalized + 0.05)
+        
+        TTC_THRESHOLD = 2.5
+        if urgency > TTC_THRESHOLD:
+            reward -= speed_ratio * 1.5 
+            reward -= (urgency - TTC_THRESHOLD) * 0.5
+
+        # 장애물 충돌
         for obs in self.obstacles:
             dist = np.linalg.norm(self.pos - obs)
-            min_obs_dist = min(min_obs_dist, dist)
-            
             if dist < (self.AGENT_RADIUS + self.OBSTACLE_RADIUS):
                 terminated = True
-                reward -= 100.0 # 충돌 시 강력한 페널티
-                return self._get_obs(), reward, terminated, False, {}
-            
-            # 근접 공포 (Repulsion)
-            if dist < 120.0:
-                reward -= (120.0 - dist) / 120.0 * 0.5
+                reward -= 30.0
+                return self._get_obs(sensor_data), reward, terminated, False, {}
 
-        # 4. [핵심 로직] 경로 상태에 따른 보상 스위칭
-        path_blocked = self._check_path_blocked()
+        # 방향 보상
+        to_objective = self.active_waypoint - self.pos
+        dist_objective = np.linalg.norm(to_objective)
         
-        to_target = self.target - self.pos
-        dist_target = np.linalg.norm(to_target)
-        
-        if speed > 10.0:
-            # 내 진행 방향이 타겟과 일치하는가?
-            cosine = np.dot(self.vel, to_target) / (speed * dist_target + 1e-8)
+        if speed > 5.0:
+            cosine = np.dot(self.vel, to_objective) / (speed * dist_objective + 1e-8)
+            reward += cosine * 0.1 
             
-            if not path_blocked:
-                # [상황 A] 길이 뚫려있음 -> 기존처럼 목표물 방향 보상 지급
-                if cosine > 0:
-                    reward += cosine * 1.0 
-                    reward += (1.0 - dist_target/self.SCREEN_SIZE) * 0.2
-            else:
-                # [상황 B] 길이 막힘 -> 목표물 쳐다보면 오히려 감점일 수 있음!
-                # 이때는 "속도 유지"와 "탐색"에 점수를 줌
-                # 목표물을 향해 정면으로 가려고 하면(cosine 높음) 감점 (빙빙 돌기 방지)
-                if cosine > 0.8: 
-                    reward -= 0.5 
-                else:
-                    # 장애물을 피해서 움직이고 있으면 보너스
-                    reward += 0.2
-        else:
-            # 멈춰있으면 큰 감점 (빙빙 돌다가 멈추는 것 방지)
-            reward -= 0.2
+            if cosine > 0.8 and urgency < TTC_THRESHOLD:
+                reward += speed_ratio * 0.1
 
-        # 5. 목표물 획득
+        # 목표 달성
+        dist_target = np.linalg.norm(self.target - self.pos)
         if dist_target < (self.AGENT_RADIUS + self.TARGET_RADIUS):
-            reward += 50.0
+            reward += 30.0 
             self.score += 1
             self.target = self._spawn_entity(padding=50, check_overlap=True)
+        
+        # 행동 일관성
+        action_diff = np.linalg.norm(np.array(action) - self.prev_action)
+        reward -= action_diff * 0.1 
+        self.prev_action = np.array(action)
 
         truncated = self.steps >= self.max_steps
-        return self._get_obs(), reward, terminated, truncated, {}
+        return self._get_obs(sensor_data), reward, terminated, truncated, {}
 
     def render(self):
         if self.render_mode == "human":
@@ -211,33 +283,46 @@ class InertiaRacerEnv(gym.Env):
                 pygame.init()
                 self.screen = pygame.display.set_mode((self.SCREEN_SIZE, self.SCREEN_SIZE))
                 self.clock = pygame.time.Clock()
+                self.font = pygame.font.SysFont("Consolas", 18)
             
             self.screen.fill((20, 20, 20))
             
-            # 경로 막힘 여부 시각화 (디버깅용)
-            blocked = self._check_path_blocked()
-            line_col = (255, 0, 0) if blocked else (0, 255, 0)
-            pygame.draw.line(self.screen, line_col, self.pos.astype(int), self.target.astype(int), 1)
-
-            # 라이다 그리기
+            # 벽 반발장 시각화 (디버깅용 - 옅은 붉은색 테두리)
+            pygame.draw.rect(self.screen, (50, 0, 0), (0, 0, 60, self.SCREEN_SIZE))
+            pygame.draw.rect(self.screen, (50, 0, 0), (self.SCREEN_SIZE-60, 0, 60, self.SCREEN_SIZE))
+            pygame.draw.rect(self.screen, (50, 0, 0), (0, 0, self.SCREEN_SIZE, 60))
+            pygame.draw.rect(self.screen, (50, 0, 0), (0, self.SCREEN_SIZE-60, self.SCREEN_SIZE, 60))
+            
             if hasattr(self, 'current_rays_rendering'):
                 for ray_dir, dist, reading in self.current_rays_rendering:
-                    color = (int(255 * (1-reading)), int(255 * reading), 0)
-                    start = self.pos
-                    end = self.pos + ray_dir * dist
-                    pygame.draw.line(self.screen, color, start.astype(int), end.astype(int), 1)
+                    c_val = int(255 * reading)
+                    c_val = max(0, min(255, c_val))
+                    start = self.pos.astype(int)
+                    end = (self.pos + ray_dir * dist).astype(int)
+                    pygame.draw.line(self.screen, (255-c_val, c_val, 0), start, end, 1)
 
-            # 장애물
             for obs in self.obstacles:
                 pygame.draw.circle(self.screen, (100, 100, 100), obs.astype(int), self.OBSTACLE_RADIUS)
                 
             pygame.draw.circle(self.screen, (255, 50, 50), self.target.astype(int), self.TARGET_RADIUS)
             pygame.draw.circle(self.screen, (255, 255, 255), self.pos.astype(int), self.AGENT_RADIUS)
             
-            # 점수 표시
-            font = pygame.font.SysFont("Arial", 20)
-            msg = f"Path Blocked: {blocked}"
-            self.screen.blit(font.render(msg, True, line_col), (10, 10))
+            if self.active_waypoint is not None and not np.array_equal(self.active_waypoint, self.target):
+                 # 가상 목표 (전진형 웨이포인트) - 파란색으로 표시
+                 pygame.draw.circle(self.screen, (0, 100, 255), self.active_waypoint.astype(int), 5)
+                 pygame.draw.line(self.screen, (0, 100, 255), self.pos.astype(int), self.active_waypoint.astype(int), 1)
+
+            speed = np.linalg.norm(self.vel)
+            info_texts = [
+                f"Score: {self.score}",
+                f"Speed: {speed:.1f}",
+                f"Accel: ({self.last_accel[0]:.1f}, {self.last_accel[1]:.1f})"
+            ]
+            
+            start_y = 50 
+            for i, text in enumerate(info_texts):
+                ts = self.font.render(text, True, (255, 255, 255))
+                self.screen.blit(ts, (10, start_y + i * 20))
             
             pygame.display.flip()
             self.clock.tick(60)
@@ -246,17 +331,27 @@ class InertiaRacerEnv(gym.Env):
         if self.screen is not None: pygame.quit()
 
 if __name__ == "__main__":
-    # 학습 및 실행 코드는 기존과 동일하게 VecFrameStack 사용 권장
     current_time = datetime.now().strftime("%H%M%S")
-    MODEL_PATH = f"exp/smart_path_{current_time}"
+    MODEL_PATH = f"exp/smart_path_last_hope_{current_time}"
     
     env = InertiaRacerEnv()
     vec_env = DummyVecEnv([lambda: env])
-    vec_env = VecFrameStack(vec_env, n_stack=4) # 프레임 스태킹 유지
+    vec_env = VecFrameStack(vec_env, n_stack=4)
     
-    print(">>> Training (Path Logic Added)...")
-    model = PPO("MlpPolicy", vec_env, verbose=1, learning_rate=0.0003, ent_coef=0.01)
-    model.learn(total_timesteps=400000)
+    print(">>> Training (Fixing Orbiting & Wall Hugging)...")
+    
+    model = PPO(
+        "MlpPolicy", 
+        vec_env, 
+        verbose=1, 
+        learning_rate=0.0003, 
+        n_steps=2048,
+        batch_size=64,
+        ent_coef=0.01,
+        policy_kwargs=dict(net_arch=[dict(pi=[256, 256], vf=[256, 256])])
+    )
+    
+    model.learn(total_timesteps=300000)
     model.save(MODEL_PATH)
     
     print(">>> Testing...")
